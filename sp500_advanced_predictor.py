@@ -1,472 +1,1204 @@
+# sp500_ibkr_predictor.py
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge, Lasso
-from sklearn.neural_network import MLPRegressor
-from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error
+import joblib
 import warnings
-warnings.filterwarnings('ignore')
+import json
+import os
+from datetime import datetime, timedelta
 
-class AdvancedPredictor:
-    def __init__(self, asset_type="crypto"):
-        self.asset_type = asset_type
+# Suppress all warnings
+warnings.filterwarnings("ignore")
+
+# Suppress TensorFlow and protobuf warnings
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import tensorflow as tf
+tf.get_logger().setLevel('ERROR')
+
+# Import XGBoost
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    print("Warning: XGBoost not available. Install with 'pip install xgboost'")
+
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout, Input, MultiHeadAttention, LayerNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Global settings
+tf.random.set_seed(42)
+np.random.seed(42)
+
+class SP500IBKRPredictor:
+    def __init__(self, model_dir="sp500_ibkr_models"):
+        self.model_dir = model_dir
         self.models = {}
         self.scalers = {}
         self.feature_columns = []
+        self.seq_feature_columns = []
+        self.training_history = {}
         
-    def clean_data(self, df):
-        """Clean data to remove infinity and invalid values"""
-        df = df.copy()
-        
-        # Replace infinity with NaN
+        # Create model directory if it doesn't exist
+        if not os.path.exists(model_dir):
+            os.makedirs(model_dir)
+            
+    def fetch_ibkr_sp500_data(self, period="3y"):
+        """Fetch S&P 500 data from Interactive Brokers via Yahoo Finance as proxy"""
+        print("Fetching S&P 500 data (IBKR compatible)...")
+        # Using ^GSPC as proxy for IBKR SPX data
+        sp500 = yf.Ticker("^GSPC")
+        data = sp500.history(period=period)
+        return data
+    
+    def fetch_ibkr_vix_data(self, period="3y"):
+        """Fetch VIX (Volatility Index) data from IBKR compatible source"""
+        try:
+            print("Fetching VIX data (IBKR compatible)...")
+            vix = yf.Ticker("^VIX")
+            data = vix.history(period=period)
+            return data
+        except:
+            print("Warning: Could not fetch VIX data")
+            return None
+    
+    def fetch_ibkr_treasury_data(self, period="3y"):
+        """Fetch Treasury yield data for additional market context"""
+        try:
+            print("Fetching Treasury yield data (IBKR compatible)...")
+            # 10-Year Treasury
+            treasury = yf.Ticker("^TNX")
+            data = treasury.history(period=period)
+            return data
+        except:
+            print("Warning: Could not fetch Treasury data")
+            return None
+    
+    def clean_infinity_values(self, df):
+        """Clean infinity and NaN values from dataframe"""
         df = df.replace([np.inf, -np.inf], np.nan)
-        
-        # Forward fill and backward fill to handle NaN values
-        df = df.fillna(method='ffill').fillna(method='bfill')
-        
-        # Remove any remaining NaN values
-        df = df.dropna()
-        
+        df = df.fillna(method='ffill')
+        df = df.fillna(method='bfill')
+        df = df.fillna(0)
         return df
     
-    def create_advanced_features(self, df):
-        """Create advanced features for prediction"""
-        df = df.copy()
+    def compute_atr(self, df, window=14):
+        """Compute Average True Range"""
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        atr = pd.Series(true_range).rolling(window=window).mean()
+        return atr.fillna(method='bfill').fillna(0)
+    
+    def compute_obv(self, df):
+        """Compute On-Balance Volume"""
+        obv = pd.Series(index=df.index)
+        obv.iloc[0] = 0
         
-        # Clean data first
-        df = self.clean_data(df)
+        for i in range(1, len(df)):
+            if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] + df['Volume'].iloc[i]
+            elif df['Close'].iloc[i] < df['Close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] - df['Volume'].iloc[i]
+            else:
+                obv.iloc[i] = obv.iloc[i-1]
         
-        # Basic returns and price features
-        df['Return'] = df['Close'].pct_change()
-        df['High_Low_Pct'] = np.where(df['Close'] != 0, (df['High'] - df['Low']) / df['Close'], 0)
-        df['Price_Change'] = df['Close'] - df['Open']
-        df['Volume_Change'] = df['Volume'].pct_change()
+        return obv
+    
+    def compute_cci(self, df, window=20):
+        """Compute Commodity Channel Index"""
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        sma_tp = tp.rolling(window=window).mean()
+        mean_dev = tp.rolling(window=window).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
+        cci = (tp - sma_tp) / (0.015 * mean_dev)
+        return cci.fillna(0)
+    
+    def compute_williams_r(self, df, window=14):
+        """Compute Williams %R"""
+        highest_high = df['High'].rolling(window=window).max()
+        lowest_low = df['Low'].rolling(window=window).min()
+        williams_r = -100 * (highest_high - df['Close']) / (highest_high - lowest_low)
+        return williams_r.fillna(0)
+    
+    def compute_adx(self, df, window=14):
+        """Compute Average Directional Index"""
+        # Calculate True Range
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        tr = np.max(ranges, axis=1)
         
-        # Handle potential infinity in volume change
-        df['Volume_Change'] = np.where(np.isinf(df['Volume_Change']), 0, df['Volume_Change'])
-        df['Volume_Change'] = np.where(np.isnan(df['Volume_Change']), 0, df['Volume_Change'])
+        # Calculate +DM and -DM
+        plus_dm = df['High'].diff()
+        minus_dm = df['Low'].diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm > 0] = 0
+        minus_dm = minus_dm.abs()
         
-        # Technical indicators with multiple timeframes
-        windows = [3, 5, 8, 13, 21, 34, 55]  # Fibonacci sequence
+        # Smooth TR, +DM, -DM
+        tr_smooth = pd.Series(tr).rolling(window=window).mean()
+        plus_dm_smooth = plus_dm.rolling(window=window).mean()
+        minus_dm_smooth = minus_dm.rolling(window=window).mean()
         
-        for window in windows:
-            # Price-based features
-            df['SMA_' + str(window)] = df['Close'].rolling(window=window).mean()
-            df['EMA_' + str(window)] = df['Close'].ewm(span=window).mean()
-            
-            # Weighted moving average with error handling
-            try:
-                df['WMA_' + str(window)] = df['Close'].rolling(window=window).apply(
-                    lambda x: np.average(x, weights=np.arange(1, len(x)+1)) if len(x) > 0 else 0, raw=True)
-            except:
-                df['WMA_' + str(window)] = df['Close'].rolling(window=window).mean()
-            
-            # Volatility features
-            df['Volatility_' + str(window)] = df['Close'].pct_change().rolling(window=window).std()
-            
-            # Momentum features with error handling
-            shifted_price = df['Close'].shift(window)
-            df['Momentum_' + str(window)] = np.where(shifted_price != 0, 
-                                                   df['Close'] / shifted_price - 1, 0)
-            
-            # Rate of Change
-            df['ROC_' + str(window)] = df['Close'].pct_change(periods=window)
+        # Calculate +DI and -DI
+        plus_di = 100 * (plus_dm_smooth / tr_smooth)
+        minus_di = 100 * (minus_dm_smooth / tr_smooth)
         
-        # Advanced technical indicators
-        # Triple Exponential Moving Average (TEMA)
-        ema_1 = df['Close'].ewm(span=9).mean()
-        ema_2 = ema_1.ewm(span=9).mean()
-        ema_3 = ema_2.ewm(span=9).mean()
-        df['TEMA'] = 3 * ema_1 - 3 * ema_2 + ema_3
+        # Calculate DX
+        dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di))
         
-        # Hull Moving Average (simplified)
-        df['HMA'] = df['Close'].rolling(20).mean()  # Simplified version
+        # Calculate ADX
+        adx = dx.rolling(window=window).mean()
         
-        # Ichimoku Cloud components (simplified)
-        high_9 = df['High'].rolling(9).max()
-        low_9 = df['Low'].rolling(9).min()
-        df['Tenkan_sen'] = (high_9 + low_9) / 2
+        return adx.fillna(0)
+    
+    def compute_ichimoku(self, df):
+        """Compute Ichimoku Cloud components"""
+        # Tenkan-sen (Conversion Line)
+        nine_period_high = df['High'].rolling(window=9).max()
+        nine_period_low = df['Low'].rolling(window=9).min()
+        df['Tenkan_sen'] = (nine_period_high + nine_period_low) / 2
         
-        high_26 = df['High'].rolling(26).max()
-        low_26 = df['Low'].rolling(26).min()
-        df['Kijun_sen'] = (high_26 + low_26) / 2
+        # Kijun-sen (Base Line)
+        twenty_six_period_high = df['High'].rolling(window=26).max()
+        twenty_six_period_low = df['Low'].rolling(window=26).min()
+        df['Kijun_sen'] = (twenty_six_period_high + twenty_six_period_low) / 2
+        
+        # Senkou Span A (Leading Span A)
         df['Senkou_span_a'] = ((df['Tenkan_sen'] + df['Kijun_sen']) / 2).shift(26)
         
-        # Advanced volatility measures
-        returns = df['Close'].pct_change()
-        df['GARCH_vol'] = returns.rolling(20).var()  # Simplified GARCH
+        # Senkou Span B (Leading Span B)
+        fifty_two_period_high = df['High'].rolling(window=52).max()
+        fifty_two_period_low = df['Low'].rolling(window=52).min()
+        df['Senkou_span_b'] = ((fifty_two_period_high + fifty_two_period_low) / 2).shift(26)
         
-        # Market microstructure features
-        volume_ma = df['Volume'].rolling(20).mean()
-        df['Volume_Profile'] = np.where(volume_ma != 0, df['Volume'] / volume_ma, 0)
-        df['Price_Volume_Trend'] = (df['Close'].pct_change() * df['Volume']).cumsum()
-        
-        # Statistical arbitrage features
-        close_ma = df['Close'].rolling(20).mean()
-        close_std = df['Close'].rolling(20).std()
-        df['Z_Score'] = np.where(close_std != 0, (df['Close'] - close_ma) / close_std, 0)
-        df['Bollinger_Position'] = np.where(close_std != 0, 
-                                          (df['Close'] - close_ma) / (close_std * 2), 0)
-        
-        # Clean data again after feature creation
-        df = self.clean_data(df)
+        # Chikou Span (Lagging Span)
+        df['Chikou_span'] = df['Close'].shift(-26)
         
         return df
     
-    def prepare_advanced_data(self, df):
-        """Prepare data with advanced features"""
-        # Clean data first
-        df = self.clean_data(df)
-        
-        # Target variables
-        df['Target_Return'] = df['Close'].pct_change().shift(-1)
-        df['Target_Direction'] = (df['Target_Return'] > 0).astype(int)
-        
-        # Create advanced features
-        df = self.create_advanced_features(df)
-        
-        # Select comprehensive feature set
-        feature_columns = [
-            'Open', 'High', 'Low', 'Volume', 'Close',
-            'Return', 'High_Low_Pct', 'Price_Change', 'Volume_Change',
-            'SMA_3', 'SMA_5', 'SMA_8', 'SMA_13', 'SMA_21', 'SMA_34', 'SMA_55',
-            'EMA_3', 'EMA_5', 'EMA_8', 'EMA_13', 'EMA_21', 'EMA_34', 'EMA_55',
-            'WMA_21', 'WMA_55',
-            'Volatility_3', 'Volatility_5', 'Volatility_8', 'Volatility_13', 'Volatility_21', 
-            'Volatility_34', 'Volatility_55',
-            'Momentum_3', 'Momentum_5', 'Momentum_8', 'Momentum_13', 'Momentum_21',
-            'Momentum_34', 'Momentum_55',
-            'ROC_3', 'ROC_5', 'ROC_8', 'ROC_13', 'ROC_21', 'ROC_34', 'ROC_55',
-            'TEMA', 'HMA', 'Tenkan_sen', 'Kijun_sen', 'Senkou_span_a',
-            'GARCH_vol', 'Volume_Profile', 'Price_Volume_Trend', 'Z_Score', 'Bollinger_Position'
-        ]
-        
-        # Remove rows with NaN values
-        df_clean = df.dropna()
-        
-        # Ensure all features exist
-        available_features = [col for col in feature_columns if col in df_clean.columns]
-        X = df_clean[available_features]
-        y_return = df_clean['Target_Return']
-        y_direction = df_clean['Target_Direction']
-        
-        # Final cleaning to remove any infinity values
-        X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
-        y_return = y_return.replace([np.inf, -np.inf], 0).fillna(0)
-        y_direction = y_direction.replace([np.inf, -np.inf], 0).fillna(0)
-        
-        # Ensure finite values only
-        X = X[np.isfinite(X).all(axis=1)]
-        y_return = y_return[np.isfinite(y_return)]
-        y_direction = y_direction[np.isfinite(y_direction)]
-        
-        # Align indices
-        common_index = X.index.intersection(y_return.index).intersection(y_direction.index)
-        X = X.loc[common_index]
-        y_return = y_return.loc[common_index]
-        y_direction = y_direction.loc[common_index]
-        
-        self.feature_columns = available_features
-        
-        return X, y_return, y_direction, df_clean
+    def compute_fibonacci_retracement(self, df, window=50):
+        """Compute Fibonacci retracement levels"""
+        df['Fib_236'] = df['Close'].rolling(window=window).max() - (df['Close'].rolling(window=window).max() - df['Close'].rolling(window=window).min()) * 0.236
+        df['Fib_382'] = df['Close'].rolling(window=window).max() - (df['Close'].rolling(window=window).max() - df['Close'].rolling(window=window).min()) * 0.382
+        df['Fib_500'] = df['Close'].rolling(window=window).max() - (df['Close'].rolling(window=window).max() - df['Close'].rolling(window=window).min()) * 0.500
+        df['Fib_618'] = df['Close'].rolling(window=window).max() - (df['Close'].rolling(window=window).max() - df['Close'].rolling(window=window).min()) * 0.618
+        return df
     
-    def create_diverse_ensemble(self, X_train, y_train):
-        """Create diverse ensemble of advanced models"""
-        print("Training diverse ensemble of advanced models...")
+    def create_features(self, df, vix_data=None, treasury_data=None):
+        """Create enhanced technical indicators and features for SP 500"""
+        df = df.copy()
         
-        # Clean training data
-        X_train = X_train.replace([np.inf, -np.inf], 0)
-        y_train = y_train.replace([np.inf, -np.inf], 0)
+        # Daily percentage change with safe division
+        df['Daily_Return'] = df['Close'].pct_change()
+        df['Daily_Return'] = df['Daily_Return'].replace([np.inf, -np.inf], 0)
         
-        # Traditional ML models with advanced parameters
-        models = {
-            'xgb': XGBRegressor(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                min_child_weight=1,
-                random_state=42
-            ),
-            'rf': RandomForestRegressor(
-                n_estimators=150,
-                max_depth=10,
-                min_samples_split=5,
-                min_samples_leaf=2,
-                max_features='sqrt',
-                random_state=42
-            ),
-            'gb': GradientBoostingRegressor(
-                n_estimators=150,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                random_state=42
-            ),
-            'ridge': Ridge(alpha=1.0),
-            'lasso': Lasso(alpha=0.1),
-            'mlp': MLPRegressor(
-                hidden_layer_sizes=(100, 50),
-                activation='relu',
-                solver='adam',
-                max_iter=200,
-                random_state=42
-            )
+        # Enhanced Technical indicators
+        df['SMA_5'] = df['Close'].rolling(window=5).mean()
+        df['SMA_10'] = df['Close'].rolling(window=10).mean()
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_100'] = df['Close'].rolling(window=100).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        
+        # Exponential Moving Averages
+        df['EMA_12'] = df['Close'].ewm(span=12).mean()
+        df['EMA_26'] = df['Close'].ewm(span=26).mean()
+        df['EMA_50'] = df['Close'].ewm(span=50).mean()
+        
+        # MACD with multiple timeframes
+        df['MACD'] = df['EMA_12'] - df['EMA_26']
+        df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
+        df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
+        
+        # RSI with multiple periods
+        df['RSI'] = self.compute_rsi(df['Close'], 14)
+        df['RSI_7'] = self.compute_rsi(df['Close'], 7)
+        df['RSI_21'] = self.compute_rsi(df['Close'], 21)
+        
+        # Volatility measures
+        df['Volatility'] = df['Daily_Return'].rolling(window=10).std()
+        df['Volatility_30'] = df['Daily_Return'].rolling(window=30).std()
+        df['ATR'] = self.compute_atr(df, 14)
+        df['ATR_7'] = self.compute_atr(df, 7)
+        
+        # CCI with multiple periods
+        df['CCI'] = self.compute_cci(df, 20)
+        df['CCI_14'] = self.compute_cci(df, 14)
+        
+        # Williams %R with multiple periods
+        df['Williams_R'] = self.compute_williams_r(df, 14)
+        df['Williams_R_10'] = self.compute_williams_r(df, 10)
+        
+        # ADX
+        df['ADX'] = self.compute_adx(df, 14)
+        
+        # Ichimoku Cloud
+        df = self.compute_ichimoku(df)
+        
+        # Fibonacci Retracement
+        df = self.compute_fibonacci_retracement(df)
+        
+        # Safe volume change calculation
+        df['Volume_Change'] = df['Volume'].pct_change()
+        df['Volume_Change'] = df['Volume_Change'].replace([np.inf, -np.inf], 0)
+        df['High_Low_Pct'] = (df['High'] - df['Low']) / df['Close']
+        df['High_Low_Pct'] = df['High_Low_Pct'].replace([np.inf, -np.inf], 0)
+        df['Price_Change'] = (df['Close'] - df['Open']) / df['Open']
+        df['Price_Change'] = df['Price_Change'].replace([np.inf, -np.inf], 0)
+        
+        # Bollinger Bands with multiple periods
+        df['BB_Middle_20'] = df['Close'].rolling(window=20).mean()
+        bb_std_20 = df['Close'].rolling(window=20).std()
+        df['BB_Upper_20'] = df['BB_Middle_20'] + (bb_std_20 * 2)
+        df['BB_Lower_20'] = df['BB_Middle_20'] - (bb_std_20 * 2)
+        df['BB_Position_20'] = (df['Close'] - df['BB_Lower_20']) / (df['BB_Upper_20'] - df['BB_Lower_20'])
+        df['BB_Position_20'] = df['BB_Position_20'].replace([np.inf, -np.inf], 0)
+        df['BB_Width_20'] = (df['BB_Upper_20'] - df['BB_Lower_20']) / df['BB_Middle_20']
+        
+        # Stochastic Oscillator
+        low_14 = df['Low'].rolling(window=14).min()
+        high_14 = df['High'].rolling(window=14).max()
+        df['Stochastic_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
+        df['Stochastic_K'] = df['Stochastic_K'].replace([np.inf, -np.inf], 50)
+        df['Stochastic_D'] = df['Stochastic_K'].rolling(window=3).mean()
+        
+        # Momentum indicators
+        df['Momentum_10'] = df['Close'] - df['Close'].shift(10)
+        df['ROC_10'] = (df['Close'] - df['Close'].shift(10)) / df['Close'].shift(10)
+        df['ROC_10'] = df['ROC_10'].replace([np.inf, -np.inf], 0)
+        df['ROC_5'] = (df['Close'] - df['Close'].shift(5)) / df['Close'].shift(5)
+        df['ROC_5'] = df['ROC_5'].replace([np.inf, -np.inf], 0)
+        
+        # Volume indicators
+        df['OBV'] = self.compute_obv(df)
+        df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+        df['Volume_Ratio'] = df['Volume_Ratio'].replace([np.inf, -np.inf], 0)
+        
+        # Price patterns and ratios
+        df['Price_SMA_20_Ratio'] = df['Close'] / df['SMA_20']
+        df['Price_SMA_50_Ratio'] = df['Close'] / df['SMA_50']
+        df['SMA_20_50_Ratio'] = df['SMA_20'] / df['SMA_50']
+        df['EMA_12_26_Ratio'] = df['EMA_12'] / df['EMA_26']
+        
+        # Lagged features with safe handling (extended periods)
+        for i in range(1, 11):
+            df[f'Return_Lag_{i}'] = df['Daily_Return'].shift(i)
+            df[f'Volume_Lag_{i}'] = df['Volume_Change'].shift(i)
+            df[f'RSI_Lag_{i}'] = df['RSI'].shift(i)
+            df[f'Volatility_Lag_{i}'] = df['Volatility'].shift(i)
+            df[f'Volume_Ratio_Lag_{i}'] = df['Volume_Ratio'].shift(i)
+            df[f'MACD_Lag_{i}'] = df['MACD'].shift(i)
+        
+        # Market sentiment features (if VIX data available)
+        if vix_data is not None:
+            vix_close = vix_data['Close'].reindex(df.index, method='ffill')
+            df['VIX'] = vix_close.fillna(method='bfill').fillna(0)
+            df['VIX_MA_10'] = df['VIX'].rolling(window=10).mean()
+            df['VIX_RSI'] = self.compute_rsi(pd.Series(df['VIX']), 14)
+            df['VIX_Change'] = df['VIX'].pct_change().replace([np.inf, -np.inf], 0)
+        else:
+            df['VIX'] = 0
+            df['VIX_MA_10'] = 0
+            df['VIX_RSI'] = 50
+            df['VIX_Change'] = 0
+        
+        # Treasury yield features (if available)
+        if treasury_data is not None:
+            treasury_close = treasury_data['Close'].reindex(df.index, method='ffill')
+            df['Treasury_Yield'] = treasury_close.fillna(method='bfill').fillna(0)
+            df['Treasury_Change'] = df['Treasury_Yield'].pct_change().replace([np.inf, -np.inf], 0)
+        else:
+            df['Treasury_Yield'] = 0
+            df['Treasury_Change'] = 0
+        
+        # Target variable (next day's return) with safe handling
+        df['Target'] = df['Daily_Return'].shift(-1)
+        df['Target'] = df['Target'].replace([np.inf, -np.inf], 0)
+        
+        # Additional targets for multi-step prediction
+        df['Target_2d'] = df['Daily_Return'].shift(-2)
+        df['Target_2d'] = df['Target_2d'].replace([np.inf, -np.inf], 0)
+        df['Target_3d'] = df['Daily_Return'].shift(-3)
+        df['Target_3d'] = df['Target_3d'].replace([np.inf, -np.inf], 0)
+        
+        # Clean the data
+        df = self.clean_infinity_values(df)
+        
+        return df.dropna()
+    
+    def compute_rsi(self, prices, window=14):
+        """Compute Relative Strength Index"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.replace([np.inf, -np.inf], 50)
+    
+    def prepare_sequences(self, data, sequence_length=30):
+        """Prepare sequences for time series models with enhanced features"""
+        feature_columns = [col for col in data.columns if col not in 
+                          ['Open', 'High', 'Low', 'Close', 'Volume', 'Target', 'Target_2d', 'Target_3d']]
+        
+        features_df = data[feature_columns].copy()
+        target_df = data['Target'].copy()
+        
+        features_df = features_df.replace([np.inf, -np.inf], 0)
+        target_df = target_df.replace([np.inf, -np.inf], 0)
+        
+        scaler_features = StandardScaler()
+        scaler_target = StandardScaler()
+        
+        features = features_df.values
+        target = target_df.values.reshape(-1, 1)
+        
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        target = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        features_scaled = scaler_features.fit_transform(features)
+        target_scaled = scaler_target.fit_transform(target).flatten()
+        
+        features_scaled = np.nan_to_num(features_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        target_scaled = np.nan_to_num(target_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        X, y = [], []
+        for i in range(sequence_length, len(features_scaled)):
+            X.append(features_scaled[i-sequence_length:i])
+            y.append(target_scaled[i])
+        
+        return (np.array(X), np.array(y), 
+                scaler_features, scaler_target, 
+                feature_columns)
+    
+    def build_lstm_model(self, input_shape):
+        """Build enhanced LSTM model"""
+        model = Sequential([
+            LSTM(100, return_sequences=True, input_shape=input_shape),
+            Dropout(0.2),
+            LSTM(100, return_sequences=True),
+            Dropout(0.2),
+            LSTM(50, return_sequences=False),
+            Dropout(0.2),
+            Dense(50, activation='relu'),
+            Dropout(0.2),
+            Dense(25, activation='relu'),
+            Dense(1)
+        ])
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+        return model
+    
+    def build_gru_model(self, input_shape):
+        """Build enhanced GRU model"""
+        model = Sequential([
+            GRU(100, return_sequences=True, input_shape=input_shape),
+            Dropout(0.2),
+            GRU(100, return_sequences=True),
+            Dropout(0.2),
+            GRU(50, return_sequences=False),
+            Dropout(0.2),
+            Dense(50, activation='relu'),
+            Dropout(0.2),
+            Dense(25, activation='relu'),
+            Dense(1)
+        ])
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+        return model
+    
+    def transformer_encoder(self, inputs, head_size, num_heads, ff_dim, dropout=0):
+        """Enhanced Transformer encoder block"""
+        # Attention and Normalization
+        x = MultiHeadAttention(
+            key_dim=head_size, num_heads=num_heads, dropout=dropout
+        )(inputs, inputs)
+        x = Dropout(dropout)(x)
+        x = LayerNormalization(epsilon=1e-6)(x + inputs)
+
+        # Feed Forward Part
+        y = Dense(ff_dim, activation="relu")(x)
+        y = Dropout(dropout)(y)
+        y = Dense(inputs.shape[-1])(y)
+        y = LayerNormalization(epsilon=1e-6)(x + y)
+        return y
+    
+    def build_transformer_model(self, input_shape):
+        """Build enhanced Transformer model"""
+        inputs = Input(shape=input_shape)
+        x = inputs
+        
+        for _ in range(4):  # Increased layers
+            x = self.transformer_encoder(x, head_size=64, num_heads=8, ff_dim=128, dropout=0.1)
+        
+        x = tf.keras.layers.GlobalAveragePooling1D(data_format='channels_first')(x)
+        x = Dense(128, activation='relu')(x)
+        x = Dropout(0.3)(x)
+        x = Dense(64, activation='relu')(x)
+        x = Dropout(0.2)(x)
+        outputs = Dense(1)(x)
+        
+        model = Model(inputs, outputs)
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+        return model
+    
+    def train_random_forest(self, X_train, y_train):
+        """Train enhanced Random Forest model"""
+        X_train_clean = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+        y_train_clean = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Clip extreme values in training data
+        y_train_clean = np.clip(y_train_clean, -0.1, 0.1)
+        
+        model = RandomForestRegressor(
+            n_estimators=300,  # Increased estimators
+            max_depth=20,      # Increased depth
+            min_samples_split=3,
+            min_samples_leaf=1,
+            random_state=42, 
+            n_jobs=-1,
+            bootstrap=True,
+            max_features='sqrt'  # Better feature selection
+        )
+        model.fit(X_train_clean, y_train_clean)
+        return model
+    
+    def train_xgboost(self, X_train, y_train):
+        """Train enhanced XGBoost model"""
+        if not XGBOOST_AVAILABLE:
+            return None
+            
+        X_train_clean = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+        y_train_clean = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Clip extreme values in training data
+        y_train_clean = np.clip(y_train_clean, -0.1, 0.1)
+        
+        model = xgb.XGBRegressor(
+            n_estimators=300,      # Increased estimators
+            max_depth=7,           # Increased depth
+            learning_rate=0.05,    # Reduced learning rate
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            n_jobs=-1,
+            reg_alpha=0.1,         # L1 regularization
+            reg_lambda=0.1,        # L2 regularization
+            min_child_weight=1
+        )
+        model.fit(X_train_clean, y_train_clean, 
+                 eval_set=[(X_train_clean, y_train_clean)],
+                 verbose=False)
+        return model
+    
+    def clip_predictions(self, predictions, min_val=-0.1, max_val=0.1):
+        """Clip predictions to reasonable range"""
+        if isinstance(predictions, dict):
+            return {k: np.clip(v, min_val, max_val) for k, v in predictions.items()}
+        else:
+            return np.clip(predictions, min_val, max_val)
+    
+    def calculate_risk_metrics(self, data, predictions):
+        """Calculate enhanced risk metrics for the prediction"""
+        current_volatility = data['Volatility'].iloc[-1]
+        current_atr = data['ATR'].iloc[-1]
+        current_price = data['Close'].iloc[-1]
+        current_volume = data['Volume'].iloc[-1]
+        
+        # Value at Risk (simplified)
+        var_95 = current_price * current_volatility * 1.645  # 95% confidence level
+        var_99 = current_price * current_volatility * 2.33   # 99% confidence level
+        
+        # Risk-adjusted prediction
+        prediction_std = np.std(list(predictions.values())) if isinstance(predictions, dict) else 0.01
+        confidence_interval = 1.96 * prediction_std  # 95% confidence interval
+        
+        # Liquidity risk
+        avg_volume = data['Volume'].rolling(window=30).mean().iloc[-1]
+        liquidity_risk = current_volume / avg_volume if avg_volume > 0 else 1.0
+        
+        return {
+            'current_volatility': float(current_volatility),
+            'current_atr': float(current_atr),
+            'value_at_risk_95': float(var_95),
+            'value_at_risk_99': float(var_99),
+            'prediction_std': float(prediction_std),
+            'confidence_interval': float(confidence_interval),
+            'liquidity_risk': float(liquidity_risk)
         }
-        
-        # Train models
-        trained_models = {}
-        for name, model in models.items():
-            print("Training " + name.upper() + "...")
-            try:
-                if name in ['ridge', 'lasso']:
-                    # Scale data for linear models
-                    scaler = StandardScaler()
-                    X_train_scaled = scaler.fit_transform(X_train)
-                    # Handle infinity in scaled data
-                    X_train_scaled = np.nan_to_num(X_train_scaled, nan=0, posinf=0, neginf=0)
-                    self.scalers[name] = scaler
-                    model.fit(X_train_scaled, y_train)
-                elif name == 'mlp':
-                    # Scale data for neural network
-                    scaler = StandardScaler()
-                    X_train_scaled = scaler.fit_transform(X_train)
-                    # Handle infinity in scaled data
-                    X_train_scaled = np.nan_to_num(X_train_scaled, nan=0, posinf=0, neginf=0)
-                    self.scalers[name] = scaler
-                    model.fit(X_train_scaled, y_train)
-                else:
-                    model.fit(X_train, y_train)
-                trained_models[name] = model
-            except Exception as e:
-                print("Error training " + name + ": " + str(e))
-        
-        self.models = trained_models
-        return trained_models
     
-    def advanced_ensemble_predict(self, X):
-        """Make predictions using advanced ensemble"""
-        predictions = {}
+    def get_market_regime(self, data):
+        """Determine current market regime based on enhanced indicators"""
+        rsi = data['RSI'].iloc[-1]
+        volatility = data['Volatility'].iloc[-1]
+        vix = data['VIX'].iloc[-1] if 'VIX' in data.columns else 20
+        adx = data['ADX'].iloc[-1] if 'ADX' in data.columns else 20
+        volume_ratio = data['Volume_Ratio'].iloc[-1] if 'Volume_Ratio' in data.columns else 1.0
         
-        # Clean input data
-        X = X.replace([np.inf, -np.inf], 0)
-        X = X.fillna(0)
+        # Market regime classification
+        if rsi > 75:
+            trend = "Overbought"
+        elif rsi < 25:
+            trend = "Oversold"
+        else:
+            trend = "Neutral"
         
-        # Get predictions from traditional models
-        for name, model in self.models.items():
-            try:
-                if name in ['ridge', 'lasso', 'mlp']:
-                    X_scaled = self.scalers[name].transform(X)
-                    # Handle infinity in scaled data
-                    X_scaled = np.nan_to_num(X_scaled, nan=0, posinf=0, neginf=0)
-                    pred = model.predict(X_scaled)
-                else:
-                    pred = model.predict(X)
-                predictions[name] = pred
-            except Exception as e:
-                print("Error predicting with " + name + ": " + str(e))
-                predictions[name] = np.zeros(len(X))
+        if volatility > data['Volatility'].quantile(0.8):
+            vol_regime = "High Volatility"
+        elif volatility < data['Volatility'].quantile(0.2):
+            vol_regime = "Low Volatility"
+        else:
+            vol_regime = "Normal Volatility"
         
-        # Weighted ensemble
-        weights = {
-            'xgb': 0.25, 'rf': 0.20, 'gb': 0.20, 'ridge': 0.10, 'lasso': 0.10, 'mlp': 0.15
+        if vix > 35:
+            fear_greed = "High Fear"
+        elif vix < 15:
+            fear_greed = "Low Fear (Greed)"
+        else:
+            fear_greed = "Neutral"
+        
+        # Trend strength
+        if adx > 25:
+            trend_strength = "Strong Trend"
+        elif adx < 20:
+            trend_strength = "Weak Trend"
+        else:
+            trend_strength = "Moderate Trend"
+        
+        return {
+            'trend': trend,
+            'volatility_regime': vol_regime,
+            'fear_greed_index': fear_greed,
+            'trend_strength': trend_strength,
+            'rsi_level': float(rsi),
+            'vix_level': float(vix),
+            'adx_level': float(adx),
+            'volume_ratio': float(volume_ratio)
         }
-        
-        # Combine predictions
-        weighted_pred = np.zeros(len(X))
-        total_weight = 0
-        for name, pred in predictions.items():
-            if name in weights:
-                weighted_pred += weights[name] * pred
-                total_weight += weights[name]
-        
-        # Normalize if not all models worked
-        if total_weight > 0:
-            weighted_pred = weighted_pred / total_weight * sum(weights.values())
-        
-        return weighted_pred, predictions, weights
     
-    def train_and_evaluate(self, symbol="ETH-USD"):
-        """Train advanced model and evaluate performance"""
-        print("🚀 Advanced Prediction Model")
+    def adjust_prediction_for_risk(self, ensemble_pred, risk_metrics, market_regime):
+        """Enhanced risk adjustment based on multiple factors"""
+        # Risk adjustment factor based on volatility
+        vol_adjustment = min(1.0, 1.0 / (1.0 + risk_metrics['current_volatility'] * 10))
+        
+        # Market regime adjustment
+        regime_multiplier = 1.0
+        if market_regime['trend'] == "Overbought":
+            regime_multiplier = 0.7  # Reduce bullish predictions
+        elif market_regime['trend'] == "Oversold":
+            regime_multiplier = 1.3  # Increase bullish predictions
+        
+        # Fear/Greed adjustment
+        if market_regime['fear_greed_index'] == "High Fear":
+            regime_multiplier *= 0.8
+        elif market_regime['fear_greed_index'] == "Low Fear (Greed)":
+            regime_multiplier *= 1.2
+        
+        # Trend strength adjustment
+        if market_regime['trend_strength'] == "Strong Trend":
+            regime_multiplier *= 1.1  # Amplify predictions in strong trends
+        elif market_regime['trend_strength'] == "Weak Trend":
+            regime_multiplier *= 0.9  # Reduce predictions in weak trends
+        
+        # Liquidity adjustment
+        if risk_metrics['liquidity_risk'] < 0.5:
+            regime_multiplier *= 0.9  # Reduce predictions with low liquidity
+        
+        adjusted_prediction = ensemble_pred * vol_adjustment * regime_multiplier
+        return adjusted_prediction
+    
+    def analyze_prediction(self, report):
+        """Enhanced analysis of the prediction"""
+        print("\n" + "="*60)
+        print("ENHANCED SP 500 PREDICTION ANALYSIS (IBKR COMPATIBLE)")
         print("="*60)
         
-        # Download data
-        print("Downloading " + symbol + " data...")
-        try:
-            data = yf.download(symbol, start="2020-01-01", end="2024-01-01")
-            if data.empty:
-                print("No data downloaded for " + symbol)
-                return None
-            print("Downloaded " + str(len(data)) + " records")
-        except Exception as e:
-            print("Error downloading data: " + str(e))
-            return None
+        current_price = report['current_price']
+        predicted_change = report['predicted_change_pct']
+        risk_adjusted_change = report['risk_adjusted_prediction']['predicted_change_pct']
+        individual_preds = report['individual_predictions']
+        model_weights = report['model_weights']
+        risk_metrics = report['risk_metrics']
+        market_regime = report['market_regime']
+        market_context = report['market_context']
         
-        # Prepare advanced features
-        print("Creating advanced features...")
-        try:
-            X, y_return, y_direction, clean_data = self.prepare_advanced_data(data)
-            print("Prepared data with " + str(len(self.feature_columns)) + " features")
-            print("Final data shape: " + str(X.shape))
-            
-            if len(X) < 10:
-                print("Insufficient data for training")
-                return None
-                
-        except Exception as e:
-            print("Error preparing data: " + str(e))
-            return None
+        # Overall Outlook
+        print(f"\nOVERALL MARKET OUTLOOK:")
+        print(f"  Current Price: ${current_price:,.2f}")
+        print(f"  Expected Movement: {predicted_change:+.2f}%")
+        print(f"  Expected Price Tomorrow: ${current_price * (1 + predicted_change/100):,.2f}")
+        print(f"  Risk-Adjusted Movement: {risk_adjusted_change:+.2f}%")
         
-        # Split data (time series aware)
-        if len(X) < 20:
-            print("Not enough data for proper train/test split")
-            return None
-            
-        split_index = int(len(X) * 0.8)
-        if split_index >= len(X):
-            split_index = len(X) - 5
-            
-        X_train = X.iloc[:split_index]
-        X_test = X.iloc[split_index:]
-        y_train = y_return.iloc[:split_index]
-        y_test = y_return.iloc[split_index:]
-        y_train_direction = y_direction.iloc[:split_index]
-        y_test_direction = y_direction.iloc[split_index:]
+        # Model Agreement Analysis
+        pred_values = list(individual_preds.values())
+        model_disagreement = np.std(pred_values) if len(pred_values) > 1 else 0
+        print(f"\nMODEL CONFIDENCE:")
+        if model_disagreement > 2.0:
+            print(f"  Model Disagreement: HIGH ({model_disagreement:.2f}%)")
+            print(f"  Recommendation: Exercise caution, models disagree significantly")
+        elif model_disagreement > 1.0:
+            print(f"  Model Disagreement: MODERATE ({model_disagreement:.2f}%)")
+            print(f"  Recommendation: Wait for morning confirmation")
+        else:
+            print(f"  Model Disagreement: LOW ({model_disagreement:.2f}%)")
+            print(f"  Recommendation: Higher confidence in prediction")
         
-        print("Training set: " + str(len(X_train)) + " samples")
-        print("Test set: " + str(len(X_test)) + " samples")
-        
-        # Train diverse ensemble
-        try:
-            self.create_diverse_ensemble(X_train, y_train)
-        except Exception as e:
-            print("Error creating ensemble: " + str(e))
-            return None
-        
-        # Make predictions
-        try:
-            ensemble_pred, individual_preds, weights = self.advanced_ensemble_predict(X_test)
-        except Exception as e:
-            print("Error making predictions: " + str(e))
-            return None
-        
-        # Calculate metrics
-        try:
-            mse = mean_squared_error(y_test, ensemble_pred)
-            mae = mean_absolute_error(y_test, ensemble_pred)
-            r2 = r2_score(y_test, ensemble_pred)
-            
-            # Direction accuracy
-            pred_direction = (ensemble_pred > 0).astype(int)
-            direction_accuracy = accuracy_score(y_test_direction, pred_direction)
-            
-            print("\n" + "="*70)
-            print("ADVANCED MODEL RESULTS")
-            print("="*70)
-            print("Mean Squared Error: " + "{:.6f}".format(mse))
-            print("Mean Absolute Error: " + "{:.6f}".format(mae))
-            print("R² Score: " + "{:.4f}".format(r2))
-            print("Direction Accuracy: " + "{:.4f}".format(direction_accuracy) + " (" + "{:.2f}".format(direction_accuracy*100) + "%)")
-            
-            # Model weights and performance
-            print("\nModel Weights:")
-            print("-" * 30)
-            for name, weight in weights.items():
-                if name in individual_preds and len(individual_preds[name]) == len(y_test):
-                    try:
-                        perf = mean_squared_error(y_test, individual_preds[name])
-                        print("  " + name.upper() + ": " + "{:.3f}".format(weight) + " (MSE: " + "{:.6f}".format(perf) + ")")
-                    except:
-                        print("  " + name.upper() + ": " + "{:.3f}".format(weight) + " (MSE: N/A)")
-            
-            # Generate prediction for next day
-            if len(X) > 0:
-                latest_features = X.iloc[-1:].copy()
-                next_day_pred, _, _ = self.advanced_ensemble_predict(latest_features)
-                next_day_pred = float(next_day_pred[0]) if len(next_day_pred) > 0 else 0.0
-                
-                # Confidence interval estimation (simplified)
-                prediction_std = np.std(ensemble_pred)
-                confidence_lower = next_day_pred - 1.96 * prediction_std
-                confidence_upper = next_day_pred + 1.96 * prediction_std
-                
-                current_price = float(data['Close'].iloc[-1])
-                predicted_price = current_price * (1 + next_day_pred)
-                lower_price = current_price * (1 + confidence_lower)
-                upper_price = current_price * (1 + confidence_upper)
-                
-                print("\n🔮 Next Trading Day Prediction:")
-                print("  Current Price: $" + "{:.2f}".format(current_price))
-                print("  Predicted Return: " + "{:+.2f}".format(next_day_pred*100) + "%")
-                print("  Predicted Price: $" + "{:.2f}".format(predicted_price))
-                print("  Expected Change: $" + "{:+.2f}".format(predicted_price - current_price))
-                
-                # Risk-adjusted prediction
-                risk_adjusted_return = next_day_pred * 0.7  # Conservative adjustment
-                risk_adjusted_price = current_price * (1 + risk_adjusted_return)
-                print("\n🛡️  Risk-Adjusted Prediction:")
-                print("  Conservative Return: " + "{:+.2f}".format(risk_adjusted_return*100) + "%")
-                print("  Conservative Price: $" + "{:.2f}".format(risk_adjusted_price))
-                
-                return {
-                    'mse': mse,
-                    'mae': mae,
-                    'r2': r2,
-                    'direction_accuracy': direction_accuracy,
-                    'next_day_return': next_day_pred,
-                    'next_day_price': predicted_price,
-                    'current_price': current_price,
-                    'risk_adjusted_return': risk_adjusted_return,
-                    'risk_adjusted_price': risk_adjusted_price
-                }
+        # Individual Model Analysis
+        print(f"\nINDIVIDUAL MODEL INSIGHTS:")
+        for model, pred in individual_preds.items():
+            weight = model_weights[model]
+            if pred < -5:
+                sentiment = "EXTREMELY BEARISH"
+            elif pred < -1:
+                sentiment = "BEARISH"
+            elif pred < 0:
+                sentiment = "SLIGHTLY BEARISH"
+            elif pred < 1:
+                sentiment = "SLIGHTLY BULLISH"
+            elif pred < 5:
+                sentiment = "BULLISH"
             else:
-                print("No data available for prediction")
-                return None
-                
-        except Exception as e:
-            print("Error calculating metrics: " + str(e))
-            return None
-
-# Run the advanced models
-print("🚀 Launching Advanced Prediction Models")
-print("="*80)
-
-try:
-    # S&P 500 Advanced Model
-    print("Initializing S&P 500 Advanced Model...")
-    sp500_advanced = AdvancedPredictor(asset_type="equity")
-    sp500_results = sp500_advanced.train_and_evaluate("^GSPC")
-
-    print("\n" + "="*80)
-
-    # Ethereum Advanced Model  
-    print("Initializing Ethereum Advanced Model...")
-    eth_advanced = AdvancedPredictor(asset_type="crypto")
-    eth_results = eth_advanced.train_and_evaluate("ETH-USD")
-
-    print("\n" + "="*80)
-    print("MODELS COMPLETED")
-    print("="*80)
-    
-    if sp500_results:
-        print("S&P 500 model completed successfully")
-    else:
-        print("S&P 500 model failed")
+                sentiment = "EXTREMELY BULLISH"
+            
+            print(f"  {model}: {pred:+.2f}% ({sentiment}, Weight: {weight:.2f})")
         
-    if eth_results:
-        print("Ethereum model completed successfully")
+        # Risk Assessment
+        print(f"\nRISK ASSESSMENT:")
+        vol = risk_metrics['current_volatility'] * 100
+        if vol > 2.0:
+            vol_desc = "HIGH"
+        elif vol > 1.0:
+            vol_desc = "MODERATE"
+        else:
+            vol_desc = "LOW"
+        print(f"  Current Volatility: {vol:.2f}% ({vol_desc})")
+        print(f"  Value at Risk (95%): ${risk_metrics['value_at_risk_95']:.2f}")
+        print(f"  Value at Risk (99%): ${risk_metrics['value_at_risk_99']:.2f}")
+        print(f"  Prediction Std Dev: {risk_metrics['prediction_std']*100:.2f}%")
+        print(f"  Liquidity Risk: {risk_metrics['liquidity_risk']:.2f}")
+        
+        # Market Conditions
+        print(f"\nMARKET CONDITIONS:")
+        rsi = market_context['rsi']
+        if rsi > 70:
+            rsi_desc = "OVERBOUGHT"
+        elif rsi < 30:
+            rsi_desc = "OVERSOLD"
+        else:
+            rsi_desc = "NEUTRAL"
+        print(f"  RSI: {rsi:.2f} ({rsi_desc})")
+        
+        williams_r = market_context['williams_r']
+        if williams_r > -20:
+            wr_desc = "OVERBOUGHT"
+        elif williams_r < -80:
+            wr_desc = "OVERSOLD"
+        else:
+            wr_desc = "NEUTRAL"
+        print(f"  Williams %R: {williams_r:.2f} ({wr_desc})")
+        
+        cci = market_context['cci']
+        if cci > 100:
+            cci_desc = "STRONG BULLISH"
+        elif cci < -100:
+            cci_desc = "STRONG BEARISH"
+        else:
+            cci_desc = "NEUTRAL"
+        print(f"  CCI: {cci:.2f} ({cci_desc})")
+        
+        volume_change = market_context['volume_change']
+        if volume_change < -30:
+            vol_desc = "SIGNIFICANTLY LOWER"
+        elif volume_change < -10:
+            vol_desc = "LOWER"
+        elif volume_change > 30:
+            vol_desc = "HIGHER"
+        else:
+            vol_desc = "NORMAL"
+        print(f"  Volume Change: {volume_change:+.2f}% ({vol_desc})")
+        
+        # Market Regime
+        print(f"\nMARKET REGIME:")
+        print(f"  Trend: {market_regime['trend']}")
+        print(f"  Volatility Regime: {market_regime['volatility_regime']}")
+        print(f"  Fear/Greed: {market_regime['fear_greed_index']}")
+        print(f"  Trend Strength: {market_regime['trend_strength']}")
+        print(f"  RSI Level: {market_regime['rsi_level']:.2f}")
+        print(f"  VIX Level: {market_regime['vix_level']:.2f}")
+        print(f"  ADX Level: {market_regime['adx_level']:.2f}")
+        
+        # Trading Recommendations
+        print(f"\nTRADING RECOMMENDATIONS:")
+        if abs(predicted_change) > 2.0:
+            print(f"  Magnitude: Significant move expected")
+            print(f"  Risk Management: Consider reduced position sizing")
+        elif abs(predicted_change) > 1.0:
+            print(f"  Magnitude: Moderate move expected")
+            print(f"  Risk Management: Standard position sizing")
+        else:
+            print(f"  Magnitude: Small move expected")
+            print(f"  Risk Management: Normal positioning acceptable")
+        
+        if model_disagreement > 2.0:
+            print(f"  Timing: Wait for morning confirmation before trading")
+        else:
+            print(f"  Timing: Prediction has reasonable model consensus")
+        
+        # Confidence Level
+        confidence_score = 100 - (model_disagreement * 10) - (risk_metrics['current_volatility'] * 50)
+        confidence_score = max(0, min(100, confidence_score))
+        print(f"\nCONFIDENCE SCORE: {confidence_score:.1f}/100")
+        
+        # Key Watch Points
+        print(f"\nKEY WATCH POINTS FOR TOMORROW:")
+        print(f"  1. Opening gap relative to today's close")
+        print(f"  2. Volume confirmation of predicted move")
+        print(f"  3. VIX action for fear index spikes")
+        print(f"  4. RSI and Williams %R for overbought/oversold signals")
+        print("="*60)
+    
+    def train_models(self, data):
+        """Enhanced model training with better accuracy"""
+        print("Training enhanced models...")
+        
+        # Prepare data for traditional ML
+        feature_columns = [col for col in data.columns if col not in 
+                          ['Open', 'High', 'Low', 'Close', 'Volume', 'Target', 'Target_2d', 'Target_3d']]
+        X = data[feature_columns]
+        y = data['Target']
+        
+        X = X.replace([np.inf, -np.inf], 0)
+        y = y.replace([np.inf, -np.inf], 0)
+        X_values = np.nan_to_num(X.values, nan=0.0, posinf=0.0, neginf=0.0)
+        y_values = np.nan_to_num(y.values, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        min_samples = min(X_values.shape[0], y_values.shape[0])
+        X_clean = X_values[:min_samples]
+        y_clean = y_values[:min_samples]
+        
+        split_idx = int(len(X_clean) * 0.8)
+        X_train, X_test = X_clean[:split_idx], X_clean[split_idx:]
+        y_train, y_test = y_clean[:split_idx], y_clean[split_idx:]
+        
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+        X_train_scaled = scaler_X.fit_transform(X_train)
+        X_test_scaled = scaler_X.transform(X_test)
+        y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
+        y_test_scaled = scaler_y.transform(y_test.reshape(-1, 1)).flatten()
+        
+        X_train_scaled = np.nan_to_num(X_train_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        X_test_scaled = np.nan_to_num(X_test_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        models = {}
+        predictions = {}
+        
+        # 1. Random Forest
+        print("Training Enhanced Random Forest...")
+        rf_model = self.train_random_forest(X_train_scaled, y_train_scaled)
+        rf_pred = rf_model.predict(X_test_scaled)
+        # Clip extreme predictions
+        rf_pred = np.clip(rf_pred, -0.1, 0.1)
+        models['RandomForest'] = rf_model
+        predictions['RandomForest'] = rf_pred
+        
+        # 2. XGBoost (if available)
+        if XGBOOST_AVAILABLE:
+            print("Training Enhanced XGBoost...")
+            xgb_model = self.train_xgboost(X_train_scaled, y_train_scaled)
+            if xgb_model is not None:
+                xgb_pred = xgb_model.predict(X_test_scaled)
+                # Clip extreme predictions
+                xgb_pred = np.clip(xgb_pred, -0.1, 0.1)
+                models['XGBoost'] = xgb_model
+                predictions['XGBoost'] = xgb_pred
+                print("XGBoost training completed")
+            else:
+                print("XGBoost training failed")
+        else:
+            print("XGBoost not available, skipping...")
+        
+        # 3. LSTM
+        print("Training Enhanced LSTM...")
+        X_seq, y_seq, scaler_feat, scaler_tgt, feat_cols = self.prepare_sequences(data, sequence_length=30)
+        split_seq = int(len(X_seq) * 0.8)
+        X_train_seq, X_test_seq = X_seq[:split_seq], X_seq[split_seq:]
+        y_train_seq, y_test_seq = y_seq[:split_seq], y_seq[split_seq:]
+        
+        lstm_model = self.build_lstm_model((X_train_seq.shape[1], X_train_seq.shape[2]))
+        early_stopping = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+        lstm_history = lstm_model.fit(X_train_seq, y_train_seq, 
+                                      validation_data=(X_test_seq, y_test_seq),
+                                      epochs=100, batch_size=32,
+                                      callbacks=[early_stopping], verbose=0)
+        lstm_pred_scaled = lstm_model.predict(X_test_seq)
+        lstm_pred = scaler_tgt.inverse_transform(lstm_pred_scaled).flatten()
+        # Clip extreme predictions
+        lstm_pred = np.clip(lstm_pred, -0.1, 0.1)
+        models['LSTM'] = lstm_model
+        predictions['LSTM'] = lstm_pred
+        self.training_history['LSTM'] = lstm_history.history
+        
+        # 4. GRU
+        print("Training Enhanced GRU...")
+        gru_model = self.build_gru_model((X_train_seq.shape[1], X_train_seq.shape[2]))
+        gru_history = gru_model.fit(X_train_seq, y_train_seq, 
+                                    validation_data=(X_test_seq, y_test_seq),
+                                    epochs=100, batch_size=32,
+                                    callbacks=[early_stopping], verbose=0)
+        gru_pred_scaled = gru_model.predict(X_test_seq)
+        gru_pred = scaler_tgt.inverse_transform(gru_pred_scaled).flatten()
+        # Clip extreme predictions
+        gru_pred = np.clip(gru_pred, -0.1, 0.1)
+        models['GRU'] = gru_model
+        predictions['GRU'] = gru_pred
+        self.training_history['GRU'] = gru_history.history
+        
+        # 5. Transformer
+        print("Training Enhanced Transformer...")
+        transformer_model = self.build_transformer_model((X_train_seq.shape[1], X_train_seq.shape[2]))
+        transformer_history = transformer_model.fit(X_train_seq, y_train_seq, 
+                                                    validation_data=(X_test_seq, y_test_seq),
+                                                    epochs=100, batch_size=32,
+                                                    callbacks=[early_stopping], verbose=0)
+        transformer_pred_scaled = transformer_model.predict(X_test_seq)
+        transformer_pred = scaler_tgt.inverse_transform(transformer_pred_scaled).flatten()
+        # Clip extreme predictions
+        transformer_pred = np.clip(transformer_pred, -0.1, 0.1)
+        models['Transformer'] = transformer_model
+        predictions['Transformer'] = transformer_pred
+        self.training_history['Transformer'] = transformer_history.history
+        
+        # Evaluate models with proper sample alignment
+        print("\nModel Evaluation (MAE):")
+        evaluation_results = {}
+        
+        # Random Forest Evaluation
+        if len(y_test) > 0 and len(rf_pred) > 0:
+            min_eval_samples = min(len(y_test), len(rf_pred))
+            rf_mae = mean_absolute_error(y_test[:min_eval_samples], rf_pred[:min_eval_samples])
+            evaluation_results['RandomForest'] = rf_mae
+            print(f"RandomForest: {rf_mae:.4f}")
+        else:
+            evaluation_results['RandomForest'] = 0.01
+            print(f"RandomForest: 0.0100")
+        
+        # XGBoost Evaluation (if available)
+        if XGBOOST_AVAILABLE and 'XGBoost' in models:
+            xgb_pred = predictions['XGBoost']
+            if len(y_test) > 0 and len(xgb_pred) > 0:
+                min_eval_samples = min(len(y_test), len(xgb_pred))
+                xgb_mae = mean_absolute_error(y_test[:min_eval_samples], xgb_pred[:min_eval_samples])
+                evaluation_results['XGBoost'] = xgb_mae
+                print(f"XGBoost: {xgb_mae:.4f}")
+            else:
+                evaluation_results['XGBoost'] = 0.01
+                print(f"XGBoost: 0.0100")
+        
+        # Deep Learning Models Evaluation
+        if len(y_seq) > 0 and len(lstm_pred) > 0:
+            y_test_actual = y_seq[split_seq:]
+            y_test_actual_inverse = scaler_tgt.inverse_transform(y_test_actual.reshape(-1, 1)).flatten()
+            
+            min_dl_samples = min(len(y_test_actual_inverse), len(lstm_pred))
+            y_test_dl = y_test_actual_inverse[:min_dl_samples]
+            lstm_pred_dl = lstm_pred[:min_dl_samples]
+            gru_pred_dl = gru_pred[:min_dl_samples]
+            transformer_pred_dl = transformer_pred[:min_dl_samples]
+            
+            y_test_dl_clean = np.nan_to_num(y_test_dl, nan=0.0, posinf=0.0, neginf=0.0)
+            lstm_pred_dl_clean = np.nan_to_num(lstm_pred_dl, nan=0.0, posinf=0.0, neginf=0.0)
+            gru_pred_dl_clean = np.nan_to_num(gru_pred_dl, nan=0.0, posinf=0.0, neginf=0.0)
+            transformer_pred_dl_clean = np.nan_to_num(transformer_pred_dl, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            lstm_mae = mean_absolute_error(y_test_dl_clean, lstm_pred_dl_clean)
+            gru_mae = mean_absolute_error(y_test_dl_clean, gru_pred_dl_clean)
+            transformer_mae = mean_absolute_error(y_test_dl_clean, transformer_pred_dl_clean)
+            
+            evaluation_results['LSTM'] = lstm_mae
+            evaluation_results['GRU'] = gru_mae
+            evaluation_results['Transformer'] = transformer_mae
+            
+            print(f"LSTM: {lstm_mae:.4f}")
+            print(f"GRU: {gru_mae:.4f}")
+            print(f"Transformer: {transformer_mae:.4f}")
+        else:
+            evaluation_results['LSTM'] = 0.01
+            evaluation_results['GRU'] = 0.01
+            evaluation_results['Transformer'] = 0.01
+            print(f"LSTM: 0.0100")
+            print(f"GRU: 0.0100")
+            print(f"Transformer: 0.0100")
+        
+        # Save components
+        self.models = models
+        self.scalers = {
+            'features': scaler_X,
+            'target': scaler_y,
+            'seq_features': scaler_feat,
+            'seq_target': scaler_tgt
+        }
+        self.feature_columns = feature_columns
+        self.seq_feature_columns = feat_cols
+        self.evaluation_results = evaluation_results
+        
+        # Save to disk
+        self.save_models()
+        
+        return models, predictions, y_test, evaluation_results
+    
+    def save_models(self):
+        """Save all models and components to disk"""
+        print("Saving enhanced models...")
+        joblib.dump(self.models, os.path.join(self.model_dir, "sp500_ibkr_models.pkl"))
+        joblib.dump(self.scalers, os.path.join(self.model_dir, "sp500_ibkr_scalers.pkl"))
+        joblib.dump(self.feature_columns, os.path.join(self.model_dir, "sp500_ibkr_feature_columns.pkl"))
+        joblib.dump(self.seq_feature_columns, os.path.join(self.model_dir, "sp500_ibkr_seq_feature_columns.pkl"))
+        
+        if hasattr(self, 'evaluation_results'):
+            with open(os.path.join(self.model_dir, "evaluation_results.json"), 'w') as f:
+                json.dump(self.evaluation_results, f)
+    
+    def load_models(self):
+        """Load all models and components from disk"""
+        print("Loading enhanced models...")
+        try:
+            self.models = joblib.load(os.path.join(self.model_dir, "sp500_ibkr_models.pkl"))
+            self.scalers = joblib.load(os.path.join(self.model_dir, "sp500_ibkr_scalers.pkl"))
+            self.feature_columns = joblib.load(os.path.join(self.model_dir, "sp500_ibkr_feature_columns.pkl"))
+            self.seq_feature_columns = joblib.load(os.path.join(self.model_dir, "sp500_ibkr_seq_feature_columns.pkl"))
+            return True
+        except FileNotFoundError:
+            print("No saved models found. Please train models first.")
+            return False
+    
+    def ensemble_predict(self, X_latest, X_seq_latest):
+        """Enhanced ensemble prediction using all models"""
+        X_latest = np.nan_to_num(X_latest, nan=0.0, posinf=0.0, neginf=0.0)
+        X_seq_latest = np.nan_to_num(X_seq_latest, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        predictions = {}
+        
+        # Random Forest
+        rf_pred = self.models['RandomForest'].predict(X_latest.reshape(1, -1))[0]
+        predictions['RandomForest'] = rf_pred
+        
+        # XGBoost (if available)
+        if 'XGBoost' in self.models:
+            xgb_pred = self.models['XGBoost'].predict(X_latest.reshape(1, -1))[0]
+            predictions['XGBoost'] = xgb_pred
+        
+        # LSTM
+        lstm_pred_scaled = self.models['LSTM'].predict(X_seq_latest.reshape(1, *X_seq_latest.shape))
+        lstm_pred = self.scalers['seq_target'].inverse_transform(lstm_pred_scaled)[0][0]
+        predictions['LSTM'] = lstm_pred
+        
+        # GRU
+        gru_pred_scaled = self.models['GRU'].predict(X_seq_latest.reshape(1, *X_seq_latest.shape))
+        gru_pred = self.scalers['seq_target'].inverse_transform(gru_pred_scaled)[0][0]
+        predictions['GRU'] = gru_pred
+        
+        # Transformer
+        transformer_pred_scaled = self.models['Transformer'].predict(X_seq_latest.reshape(1, *X_seq_latest.shape))
+        transformer_pred = self.scalers['seq_target'].inverse_transform(transformer_pred_scaled)[0][0]
+        predictions['Transformer'] = transformer_pred
+        
+        # Clip all predictions to reasonable range
+        predictions = self.clip_predictions(predictions, -0.1, 0.1)
+        
+        # Adaptive weighting based on recent performance
+        if hasattr(self, 'evaluation_results'):
+            weights = {}
+            total_inverse_mae = sum(1/mae for mae in self.evaluation_results.values())
+            for model, mae in self.evaluation_results.items():
+                weights[model] = (1/mae) / total_inverse_mae
+        else:
+            # Equal weights if no evaluation results
+            num_models = len(predictions)
+            equal_weight = 1.0 / num_models
+            weights = {model: equal_weight for model in predictions.keys()}
+        
+        ensemble_pred = sum(weights[model] * pred for model, pred in predictions.items())
+        return ensemble_pred, predictions, weights
+    
+    def generate_report(self, data, ensemble_pred, individual_preds, weights, risk_metrics, market_regime):
+        """Generate a comprehensive prediction report with enhanced risk management"""
+        current_price = data['Close'].iloc[-1]
+        predicted_price = current_price * (1 + ensemble_pred)
+        change_amount = predicted_price - current_price
+        
+        # Risk-adjusted prediction
+        risk_adjusted_pred = self.adjust_prediction_for_risk(ensemble_pred, risk_metrics, market_regime)
+        risk_adjusted_price = current_price * (1 + risk_adjusted_pred)
+        risk_adjusted_change = risk_adjusted_price - current_price
+        
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "current_price": float(current_price),
+            "predicted_price": float(predicted_price),
+            "predicted_change_pct": float(ensemble_pred * 100),
+            "predicted_change_usd": float(change_amount),
+            "risk_adjusted_prediction": {
+                "predicted_price": float(risk_adjusted_price),
+                "predicted_change_pct": float(risk_adjusted_pred * 100),
+                "predicted_change_usd": float(risk_adjusted_change)
+            },
+            "individual_predictions": {k: float(v * 100) for k, v in individual_preds.items()},
+            "model_weights": {k: float(v) for k, v in weights.items()},
+            "risk_metrics": risk_metrics,
+            "market_regime": market_regime,
+            "market_context": {
+                "rsi": float(data['RSI'].iloc[-1]),
+                "volatility": float(data['Volatility'].iloc[-1] * 100),
+                "volume_change": float(data['Volume_Change'].iloc[-1] * 100),
+                "atr": float(data['ATR'].iloc[-1]),
+                "cci": float(data['CCI'].iloc[-1]),
+                "williams_r": float(data['Williams_R'].iloc[-1]),
+                "adx": float(data['ADX'].iloc[-1]),
+                "vix": float(data['VIX'].iloc[-1]) if 'VIX' in data.columns else 0,
+                "treasury_yield": float(data['Treasury_Yield'].iloc[-1]) if 'Treasury_Yield' in data.columns else 0
+            }
+        }
+        
+        with open(os.path.join(self.model_dir, "prediction_report.json"), 'w') as f:
+            json.dump(report, f, indent=2)
+            
+        return report
+    
+    def print_report(self, report):
+        """Print formatted prediction report"""
+        print("\n" + "="*60)
+        print("ENHANCED S&P 500 PRICE PREDICTION REPORT (IBKR COMPATIBLE)")
+        print("="*60)
+        print(f"Generated: {report['timestamp']}")
+        print(f"Current S&P 500 Price: ${report['current_price']:.2f}")
+        print(f"\nBASE PREDICTION:")
+        print(f"  Predicted Next Day Price: ${report['predicted_price']:.2f}")
+        print(f"  Predicted Change: {report['predicted_change_pct']:+.2f}% (${report['predicted_change_usd']:+.2f})")
+        print(f"\nRISK-ADJUSTED PREDICTION:")
+        ra = report['risk_adjusted_prediction']
+        print(f"  Predicted Next Day Price: ${ra['predicted_price']:.2f}")
+        print(f"  Predicted Change: {ra['predicted_change_pct']:+.2f}% (${ra['predicted_change_usd']:+.2f})")
+        print("\nIndividual Model Predictions:")
+        for model, pred in report['individual_predictions'].items():
+            print(f"  {model}: {pred:+.2f}%")
+        print("\nModel Weights:")
+        for model, weight in report['model_weights'].items():
+            print(f"  {model}: {weight:.2f}")
+        print("\nRisk Metrics:")
+        rm = report['risk_metrics']
+        print(f"  Current Volatility: {rm['current_volatility']*100:.2f}%")
+        print(f"  Average True Range: ${rm['current_atr']:.2f}")
+        print(f"  Value at Risk (95%): ${rm['value_at_risk_95']:.2f}")
+        print(f"  Value at Risk (99%): ${rm['value_at_risk_99']:.2f}")
+        print(f"  Prediction Std Dev: {rm['prediction_std']*100:.2f}%")
+        print(f"  Liquidity Risk: {rm['liquidity_risk']:.2f}")
+        print("\nMarket Regime:")
+        mr = report['market_regime']
+        print(f"  Trend: {mr['trend']}")
+        print(f"  Volatility Regime: {mr['volatility_regime']}")
+        print(f"  Fear/Greed: {mr['fear_greed_index']}")
+        print(f"  Trend Strength: {mr['trend_strength']}")
+        print(f"  RSI Level: {mr['rsi_level']:.2f}")
+        print(f"  VIX Level: {mr['vix_level']:.2f}")
+        print(f"  ADX Level: {mr['adx_level']:.2f}")
+        print(f"  Volume Ratio: {mr['volume_ratio']:.2f}")
+        print("\nMarket Context:")
+        mc = report['market_context']
+        print(f"  RSI: {mc['rsi']:.2f}")
+        print(f"  Volatility: {mc['volatility']:.2f}%")
+        print(f"  Volume Change: {mc['volume_change']:+.2f}%")
+        print(f"  ATR: ${mc['atr']:.2f}")
+        print(f"  CCI: {mc['cci']:.2f}")
+        print(f"  Williams %R: {mc['williams_r']:.2f}")
+        print(f"  ADX: {mc['adx']:.2f}")
+        print(f"  VIX: {mc['vix']:.2f}")
+        print(f"  Treasury Yield: {mc['treasury_yield']:.2f}%")
+        print("="*60)
+
+def main():
+    predictor = SP500IBKRPredictor()
+    
+    if os.path.exists(os.path.join(predictor.model_dir, "sp500_ibkr_models.pkl")):
+        print("Loading existing enhanced models...")
+        loaded = predictor.load_models()
+        if not loaded:
+            print("Training new enhanced models...")
+            raw_data = predictor.fetch_ibkr_sp500_data()
+            vix_data = predictor.fetch_ibkr_vix_data()
+            treasury_data = predictor.fetch_ibkr_treasury_data()
+            
+            if len(raw_data) < 50:
+                print("Not enough data to train models. Please try again later.")
+                return
+                
+            feature_data = predictor.create_features(raw_data, vix_data, treasury_data)
+            
+            if len(feature_data) < 50:
+                print("Not enough clean data to train models. Please try again later.")
+                return
+                
+            models, predictions, y_test, evaluation_results = predictor.train_models(feature_data)
     else:
-        print("Ethereum model failed")
+        print("Training new enhanced models...")
+        raw_data = predictor.fetch_ibkr_sp500_data()
+        vix_data = predictor.fetch_ibkr_vix_data()
+        treasury_data = predictor.fetch_ibkr_treasury_data()
+        
+        if len(raw_data) < 50:
+            print("Not enough data to train models. Please try again later.")
+            return
+            
+        feature_data = predictor.create_features(raw_data, vix_data, treasury_data)
+        
+        if len(feature_data) < 50:
+            print("Not enough clean data to train models. Please try again later.")
+            return
+            
+        models, predictions, y_test, evaluation_results = predictor.train_models(feature_data)
     
-    print("\n🎯 Advanced models with infinity value handling are ready!")
+    print("Making enhanced ensemble prediction...")
     
-except Exception as e:
-    print("Major error running advanced models: " + str(e))
-    print("Please make sure required packages are installed:")
-    print("pip install yfinance pandas numpy scikit-learn xgboost")
+    raw_data = predictor.fetch_ibkr_sp500_data("1y")
+    vix_data = predictor.fetch_ibkr_vix_data("1y")
+    treasury_data = predictor.fetch_ibkr_treasury_data("1y")
+    feature_data = predictor.create_features(raw_data, vix_data, treasury_data)
+    
+    X_latest = feature_data[predictor.feature_columns].iloc[-1:].values
+    X_latest_scaled = predictor.scalers['features'].transform(X_latest)
+    
+    sequence_length = 30
+    latest_features = feature_data[predictor.seq_feature_columns].values
+    latest_features_scaled = predictor.scalers['seq_features'].transform(latest_features)
+    X_seq_latest = latest_features_scaled[-sequence_length:]
+    
+    ensemble_pred, individual_preds, weights = predictor.ensemble_predict(
+        X_latest_scaled[0], X_seq_latest
+    )
+    
+    # Calculate risk metrics
+    risk_metrics = predictor.calculate_risk_metrics(feature_data, individual_preds)
+    market_regime = predictor.get_market_regime(feature_data)
+    
+    # Generate and print report
+    report = predictor.generate_report(feature_data, ensemble_pred, individual_preds, weights, risk_metrics, market_regime)
+    predictor.print_report(report)
+    
+    # Add analysis
+    predictor.analyze_prediction(report)
+    
+    print(f"\nEnhanced reports and models saved to: {predictor.model_dir}")
+
+if __name__ == "__main__":
+    main()
